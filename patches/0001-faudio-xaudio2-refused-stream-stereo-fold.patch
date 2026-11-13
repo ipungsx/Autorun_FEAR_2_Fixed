@@ -1,0 +1,356 @@
+diff --git a/libs/faudio/src/FAudio_platform_win32.c b/libs/faudio/src/FAudio_platform_win32.c
+index 714d36c6..0c2ae71c 100644
+--- a/libs/faudio/src/FAudio_platform_win32.c
++++ b/libs/faudio/src/FAudio_platform_win32.c
+@@ -43,6 +43,9 @@
+ #define _SPEAKER_POSITIONS_ /* Defined by SDK. */
+ #include "FAudio_internal.h"
+ 
++#include "wine/debug.h"
++WINE_DEFAULT_DEBUG_CHANNEL(xaudio2);
++
+ static CRITICAL_SECTION faudio_cs = { NULL, -1, 0, 0, 0, 0 };
+ static IMMDeviceEnumerator *device_enumerator;
+ static HRESULT init_hr;
+@@ -61,8 +64,63 @@ struct FAudioAudioClientThreadArgs
+ 	HANDLE events[2];
+ 	FAudio *audio;
+ 	UINT updateSize;
++
++	/* The engine mixes in engineChannels. When the device refused that
++	 * layout, it is opened in stereo instead and engineBuffer holds the
++	 * engine's output until it is folded down into the device buffer. */
++	UINT engineChannels;
++	DWORD engineMask;
++	float *engineBuffer;
++};
++
++/* Speaker positions, in WAVEFORMATEXTENSIBLE channel mask bit order, as
++ * left and right gains for a stereo fold-down. LFE is dropped. */
++static const float FAudio_StereoGains[18][2] =
++{
++	{1.0f, 0.0f}, {0.0f, 1.0f}, {0.70710678f, 0.70710678f}, {0.0f, 0.0f},
++	{0.70710678f, 0.0f}, {0.0f, 0.70710678f}, {0.85f, 0.15f}, {0.15f, 0.85f},
++	{0.5f, 0.5f}, {0.70710678f, 0.0f}, {0.0f, 0.70710678f}, {0.5f, 0.5f},
++	{0.70710678f, 0.0f}, {0.5f, 0.5f}, {0.0f, 0.70710678f},
++	{0.70710678f, 0.0f}, {0.5f, 0.5f}, {0.0f, 0.70710678f}
+ };
+ 
++static void FAudio_FoldToStereo(
++	const struct FAudioAudioClientThreadArgs *args,
++	const float *in,
++	float *out
++) {
++	float gains[32][2];
++	UINT ch = 0, bit, i, c;
++
++	for (bit = 0; bit < 18 && ch < args->engineChannels; bit += 1)
++	{
++		if (args->engineMask & (1u << bit))
++		{
++			gains[ch][0] = FAudio_StereoGains[bit][0];
++			gains[ch][1] = FAudio_StereoGains[bit][1];
++			ch += 1;
++		}
++	}
++	for (; ch < args->engineChannels && ch < 32; ch += 1)
++	{
++		gains[ch][0] = gains[ch][1] = 0.5f;
++	}
++
++	for (i = 0; i < args->updateSize; i += 1)
++	{
++		float l = 0.0f, r = 0.0f;
++		for (c = 0; c < args->engineChannels && c < 32; c += 1)
++		{
++			l += in[c] * gains[c][0];
++			r += in[c] * gains[c][1];
++		}
++		out[0] = l > 1.0f ? 1.0f : (l < -1.0f ? -1.0f : l);
++		out[1] = r > 1.0f ? 1.0f : (r < -1.0f ? -1.0f : r);
++		in += args->engineChannels;
++		out += 2;
++	}
++}
++
+ void FAudio_Log(char const *msg)
+ {
+ 	OutputDebugStringA(msg);
+@@ -129,7 +187,22 @@ static HRESULT FAudio_FillAudioClientBuffer(
+ 			args->updateSize * args->format.Format.nBlockAlign
+ 		);
+ 
+-		if (args->audio->active)
++		if (args->engineBuffer)
++		{
++			FAudio_zero(
++				args->engineBuffer,
++				args->updateSize * args->engineChannels * sizeof(float)
++			);
++			if (args->audio->active)
++			{
++				FAudio_INTERNAL_UpdateEngine(
++					args->audio,
++					args->engineBuffer
++				);
++			}
++			FAudio_FoldToStereo(args, args->engineBuffer, (float*) buffer);
++		}
++		else if (args->audio->active)
+ 		{
+ 			FAudio_INTERNAL_UpdateEngine(
+ 				args->audio,
+@@ -159,12 +232,65 @@ static DWORD WINAPI FAudio_AudioClientThread(void *user)
+ 
+ 	FAudio_set_thread_name(__func__);
+ 
+-	hr = IAudioClient_GetService(
+-		args->client,
+-		&IID_IAudioRenderClient,
+-		(void **)&render_client
+-	);
+-	FAudio_assert(!FAILED(hr) && "Failed to get IAudioRenderClient service!");
++	render_client = NULL;
++	hr = E_POINTER;
++	if (args->client)
++		hr = IAudioClient_GetService(
++			args->client,
++			&IID_IAudioRenderClient,
++			(void **)&render_client
++		);
++	if (FAILED(hr) || !render_client)
++	{
++		/* The stream never initialized (the audio driver refused its
++		 * format, or the device is gone). Asserts are compiled out in
++		 * release builds, so carrying on would call through a NULL
++		 * render client and take the whole game down.
++		 *
++		 * Simply idling is not enough either: games wait on XAudio2
++		 * buffer and stream callbacks (OnBufferEnd and friends), which
++		 * only fire while the engine mixes. So keep the engine running
++		 * in real time and discard its output, as if the device were a
++		 * silent one. */
++		LARGE_INTEGER freq, start, now;
++		UINT64 mixed = 0, due;
++		DWORD wait_ms;
++		float *scratch;
++
++		WINE_ERR("no IAudioRenderClient (hr %#lx); mixing to a silent device "
++		    "(%u ch, %lu Hz, %u frames per update)\n", hr,
++		    args->engineChannels, args->format.Format.nSamplesPerSec,
++		    args->updateSize);
++
++		scratch = FAudio_malloc(args->updateSize * args->engineChannels * sizeof(float));
++		wait_ms = args->updateSize * 1000 / max(args->format.Format.nSamplesPerSec, 1);
++		if (!wait_ms) wait_ms = 1;
++		QueryPerformanceFrequency(&freq);
++		QueryPerformanceCounter(&start);
++
++		while (WaitForSingleObject(args->events[1], wait_ms) == WAIT_TIMEOUT)
++		{
++			if (!scratch) continue;
++			QueryPerformanceCounter(&now);
++			due = (UINT64)(now.QuadPart - start.QuadPart) *
++				args->format.Format.nSamplesPerSec / freq.QuadPart;
++			/* Never try to catch up more than a quarter second at once. */
++			if (due > mixed + args->format.Format.nSamplesPerSec / 4)
++				mixed = due - args->format.Format.nSamplesPerSec / 4;
++			while (mixed + args->updateSize <= due)
++			{
++				FAudio_zero(scratch, args->updateSize * args->engineChannels * sizeof(float));
++				if (args->audio->active)
++					FAudio_INTERNAL_UpdateEngine(args->audio, scratch);
++				mixed += args->updateSize;
++			}
++		}
++
++		FAudio_free(scratch);
++		FAudio_free(args->engineBuffer);
++		FAudio_free(args);
++		return 0;
++	}
+ 
+ 	hr = IAudioClient_GetBufferSize(args->client, &frames);
+ 	FAudio_assert(!FAILED(hr) && "Failed to get IAudioClient buffer size!");
+@@ -193,6 +319,7 @@ static DWORD WINAPI FAudio_AudioClientThread(void *user)
+ 	FAudio_assert(!FAILED(hr) && "Failed to stop IAudioClient!");
+ 
+ 	IAudioRenderClient_Release(render_client);
++	FAudio_free(args->engineBuffer);
+ 	FAudio_free(args);
+ 	return 0;
+ }
+@@ -387,6 +514,15 @@ void FAudio_PlatformInit(
+ 		);
+ 	}
+ 
++	/* What the engine mixes; the device format may end up different. */
++	WAVEFORMATEXTENSIBLE engine = args->format;
++	BOOL fold = FALSE;
++	args->engineChannels = args->format.Format.nChannels;
++	args->engineMask = args->format.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE
++		? args->format.dwChannelMask
++		: (args->format.Format.nChannels == 1 ? SPEAKER_FRONT_CENTER : SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
++	args->engineBuffer = NULL;
++
+ 	audioEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 	FAudio_assert(!!audioEvent && "Failed to create FAudio thread buffer event!");
+ 
+@@ -395,49 +531,104 @@ void FAudio_PlatformInit(
+ 
+ 	hr = FAudio_OpenDevice(deviceIndex, &device);
+ 	FAudio_assert(!FAILED(hr) && "Failed to get audio device!");
++	if (FAILED(hr) || !device) WINE_ERR("FAudio_OpenDevice(%u) failed, hr %#lx\n", deviceIndex, hr);
+ 
+-	hr = IMMDevice_Activate(
+-		device,
+-		&IID_IAudioClient,
+-		CLSCTX_ALL,
+-		NULL,
+-		(void **)&data->client
+-	);
+-	FAudio_assert(!FAILED(hr) && "Failed to create audio client!");
+-	IMMDevice_Release(device);
++	if (device)
++	{
++		hr = IMMDevice_Activate(
++			device,
++			&IID_IAudioClient,
++			CLSCTX_ALL,
++			NULL,
++			(void **)&data->client
++		);
++		FAudio_assert(!FAILED(hr) && "Failed to create audio client!");
++		if (FAILED(hr)) WINE_ERR("IMMDevice_Activate(IAudioClient) failed, hr %#lx\n", hr);
++		IMMDevice_Release(device);
++	}
+ 
+ 	if (flags & FAUDIO_1024_QUANTUM) duration = 213333;
+ 	else duration = 100000;
+ 
+-	hr = IAudioClient_Initialize(
+-		data->client,
+-		AUDCLNT_SHAREMODE_SHARED,
+-		AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+-		duration * 3,
+-		0,
+-		&args->format.Format,
+-		&GUID_NULL
+-	);
+-	FAudio_assert(!FAILED(hr) && "Failed to initialize audio client!");
++	if (data->client)
++	{
++		hr = IAudioClient_Initialize(
++			data->client,
++			AUDCLNT_SHAREMODE_SHARED,
++			AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
++			duration * 3,
++			0,
++			&args->format.Format,
++			&GUID_NULL
++		);
++		FAudio_assert(!FAILED(hr) && "Failed to initialize audio client!");
++		if (FAILED(hr))
++			WINE_ERR("IAudioClient_Initialize failed, hr %#lx: tag %#x, %u ch, %lu Hz, %u bits, "
++			    "align %u, %lu B/s, cbSize %u, mask %#lx, duration %ld\n", hr,
++			    args->format.Format.wFormatTag, args->format.Format.nChannels,
++			    args->format.Format.nSamplesPerSec, args->format.Format.wBitsPerSample,
++			    args->format.Format.nBlockAlign, args->format.Format.nAvgBytesPerSec,
++			    args->format.Format.cbSize, args->format.dwChannelMask, (long)(duration * 3));
++
++		/* Some audio drivers only take mono or stereo. The engine keeps
++		 * mixing the layout the game asked for, and the thread folds it
++		 * down to stereo before handing it to the device. */
++		if (FAILED(hr) && args->format.Format.nChannels > 2 &&
++		    args->format.Format.wBitsPerSample == 32)
++		{
++			args->format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE;
++			args->format.Format.nChannels = 2;
++			args->format.Format.nBlockAlign = 2 * sizeof(float);
++			args->format.Format.nAvgBytesPerSec =
++				args->format.Format.nSamplesPerSec * args->format.Format.nBlockAlign;
++			args->format.Format.wBitsPerSample = 32;
++			args->format.Format.cbSize = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
++			args->format.Samples.wValidBitsPerSample = 32;
++			args->format.dwChannelMask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
++			args->format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
++
++			hr = IAudioClient_Initialize(
++				data->client,
++				AUDCLNT_SHAREMODE_SHARED,
++				AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
++				duration * 3,
++				0,
++				&args->format.Format,
++				&GUID_NULL
++			);
++			if (SUCCEEDED(hr))
++			{
++				fold = TRUE;
++				WINE_ERR("device refused %u channels; mixing %u channels and folding them down to stereo\n",
++				    engine.Format.nChannels, engine.Format.nChannels);
++			}
++			else
++			{
++				WINE_ERR("stereo fallback failed too, hr %#lx\n", hr);
++				args->format = engine;
++			}
++		}
+ 
+-	hr = IAudioClient_SetEventHandle(data->client, audioEvent);
+-	FAudio_assert(!FAILED(hr) && "Failed to set audio client event!");
++		hr = IAudioClient_SetEventHandle(data->client, audioEvent);
++		FAudio_assert(!FAILED(hr) && "Failed to set audio client event!");
++		if (FAILED(hr)) WINE_ERR("IAudioClient_SetEventHandle failed, hr %#lx\n", hr);
++	}
+ 
+-	mixFormat->Format.wFormatTag = args->format.Format.wFormatTag;
+-	mixFormat->Format.nChannels = args->format.Format.nChannels;
+-	mixFormat->Format.nSamplesPerSec = args->format.Format.nSamplesPerSec;
+-	mixFormat->Format.nAvgBytesPerSec = args->format.Format.nAvgBytesPerSec;
+-	mixFormat->Format.nBlockAlign = args->format.Format.nBlockAlign;
+-	mixFormat->Format.wBitsPerSample = args->format.Format.wBitsPerSample;
++	mixFormat->Format.wFormatTag = engine.Format.wFormatTag;
++	mixFormat->Format.nChannels = engine.Format.nChannels;
++	mixFormat->Format.nSamplesPerSec = engine.Format.nSamplesPerSec;
++	mixFormat->Format.nAvgBytesPerSec = engine.Format.nAvgBytesPerSec;
++	mixFormat->Format.nBlockAlign = engine.Format.nBlockAlign;
++	mixFormat->Format.wBitsPerSample = engine.Format.wBitsPerSample;
+ 
+-	if (args->format.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
++	if (engine.Format.wFormatTag == WAVE_FORMAT_EXTENSIBLE)
+ 	{
+ 		mixFormat->Format.cbSize = sizeof(FAudioWaveFormatExtensible) - sizeof(FAudioWaveFormatEx);
+-		mixFormat->Samples.wValidBitsPerSample = args->format.Samples.wValidBitsPerSample;
+-		mixFormat->dwChannelMask = args->format.dwChannelMask;
++		mixFormat->Samples.wValidBitsPerSample = engine.Samples.wValidBitsPerSample;
++		mixFormat->dwChannelMask = engine.dwChannelMask;
+ 		FAudio_memcpy(
+ 			&mixFormat->SubFormat,
+-			&args->format.SubFormat,
++			&engine.SubFormat,
+ 			sizeof(GUID)
+ 		);
+ 	}
+@@ -453,6 +644,21 @@ void FAudio_PlatformInit(
+ 	if (flags & FAUDIO_1024_QUANTUM) args->updateSize = (UINT)(args->format.Format.nSamplesPerSec / (1000.0 / (64.0 / 3.0)));
+ 	else args->updateSize = args->format.Format.nSamplesPerSec / 100;
+ 
++	if (fold)
++	{
++		args->engineBuffer = FAudio_malloc(
++			args->updateSize * args->engineChannels * sizeof(float)
++		);
++		if (!args->engineBuffer)
++		{
++			/* Without the staging buffer the engine would write six
++			 * channels into a stereo buffer; go silent instead. */
++			WINE_ERR("out of memory for the stereo fold-down buffer\n");
++			if (data->client) IAudioClient_Release(data->client);
++			data->client = NULL;
++		}
++	}
++
+ 	data->audioThread = CreateThread(NULL, 0, &FAudio_AudioClientThread, args, 0, NULL);
+ 	FAudio_assert(!!data->audioThread && "Failed to create audio client thread!");
+ 

@@ -1,0 +1,32 @@
+diff --git a/dlls/msvcrt/thread.c b/dlls/msvcrt/thread.c
+index 2a8a99b8..3fa5ce5e 100644
+--- a/dlls/msvcrt/thread.c
++++ b/dlls/msvcrt/thread.c
+@@ -198,7 +198,26 @@ static DWORD CALLBACK _beginthreadex_trampoline(LPVOID arg)
+     data->module = local_trampoline.module;
+ #endif
+ 
+-    retval = local_trampoline.start_address_ex(local_trampoline.arglist);
++    {
++        /* Autorun diagnostic: say which module a worker thread runs and what
++         * it returns, so a game whose workers quit early can be traced. */
++        HMODULE mod = NULL;
++        char name[MAX_PATH] = "?";
++        DWORD tid = GetCurrentThreadId();
++
++        if (GetModuleHandleExA( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                (const char *)local_trampoline.start_address_ex, &mod ))
++            GetModuleFileNameA( mod, name, sizeof(name) );
++        ERR( "thread %04lx starts %p (%s+%#lx) arg %p\n", tid, local_trampoline.start_address_ex,
++             name, (unsigned long)((char *)local_trampoline.start_address_ex - (char *)mod),
++             local_trampoline.arglist );
++        SetLastError( 0 );
++        retval = local_trampoline.start_address_ex(local_trampoline.arglist);
++        ERR( "thread %04lx (%s+%#lx) returned %u, last error %lu\n", tid, name,
++             (unsigned long)((char *)local_trampoline.start_address_ex - (char *)mod),
++             retval, GetLastError() );
++    }
+     _endthreadex(retval);
+ }
+ /*********************************************************************

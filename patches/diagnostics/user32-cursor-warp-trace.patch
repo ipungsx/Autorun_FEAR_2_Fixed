@@ -1,0 +1,75 @@
+diff --git a/dlls/user32/input.c b/dlls/user32/input.c
+index 051f4e48..56e02f22 100644
+--- a/dlls/user32/input.c
++++ b/dlls/user32/input.c
+@@ -906,3 +906,48 @@ void WINAPI UndelegateInput(void *p1, void *p2)
+ {
+     FIXME( "p1 %p p2 %p stub!\n", p1, p2 );
+ }
++
++/* Autorun diagnostic: how far the cursor travelled between a program's
++ * SetCursorPos calls. A mouse-look game warps the cursor to its window's
++ * centre every frame and turns by the distance it finds; a distance that
++ * stays nonzero with the stick at rest is a camera that spins by itself. */
++BOOL WINAPI SetCursorPos( INT x, INT y )
++{
++    static LONG calls, moved_calls;
++    static LONG sum_x, sum_y;
++    POINT before = {0}, after = {0};
++    LONG n = InterlockedIncrement( &calls );
++    BOOL ret;
++    int dx, dy;
++
++    NtUserGetCursorPos( &before );
++    ret = NtUserSetCursorPos( x, y );
++    NtUserGetCursorPos( &after );
++    dx = before.x - x;
++    dy = before.y - y;
++    if (dx || dy)
++    {
++        LONG m = InterlockedIncrement( &moved_calls );
++        sum_x += dx;
++        sum_y += dy;
++        if (m <= 150 || !(m % 300))
++            ERR( "call %ld: cursor was at %ld,%ld, program warps to %d,%d (moved %d,%d), now at %ld,%ld; "
++                 "%ld of %ld calls found it moved, total %ld,%ld\n", n, before.x, before.y, x, y, dx, dy,
++                 after.x, after.y, m, n, sum_x, sum_y );
++    }
++    else if (n <= 20 || !(n % 600))
++        ERR( "call %ld: cursor still at %d,%d, now at %ld,%ld; %ld of %ld calls found it moved, total %ld,%ld\n",
++             n, x, y, after.x, after.y, moved_calls, n, sum_x, sum_y );
++    return ret;
++}
++
++BOOL WINAPI ClipCursor( const RECT *rect )
++{
++    static LONG calls;
++    if (InterlockedIncrement( &calls ) <= 30)
++    {
++        if (rect) ERR( "clip to %ld,%ld-%ld,%ld\n", rect->left, rect->top, rect->right, rect->bottom );
++        else ERR( "clip released\n" );
++    }
++    return NtUserClipCursor( (RECT *)rect );
++}
+diff --git a/dlls/user32/user32.spec b/dlls/user32/user32.spec
+index 241b4005..b292c4f9 100644
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -298,7 +298,7 @@
+ @ stub ClientThreadConnect
+ @ stub ClientThreadSetup
+ @ stdcall ClientToScreen(long ptr)
+-@ stdcall -import ClipCursor(ptr) NtUserClipCursor
++@ stdcall ClipCursor(ptr)
+ @ stdcall CloseClipboard() NtUserCloseClipboard
+ @ stdcall CloseDesktop(long) NtUserCloseDesktop
+ @ stdcall CloseGestureInfoHandle(long)
+@@ -1029,7 +1029,7 @@
+ @ stdcall SetCoalescableTimer(long long long ptr long) NtUserSetTimer
+ @ stdcall -import SetCursor(long) NtUserSetCursor
+ @ stub SetCursorContents
+-@ stdcall -import SetCursorPos(long long) NtUserSetCursorPos
++@ stdcall SetCursorPos(long long)
+ @ stdcall SetDebugErrorLevel(long)
+ @ stdcall SetDeskWallpaper(str)
+ # @ stub SetDesktopColorTransform

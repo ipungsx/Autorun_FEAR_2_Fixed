@@ -1,0 +1,305 @@
+diff --git a/dlls/user32/input.c b/dlls/user32/input.c
+index 051f4e48..da89412a 100644
+--- a/dlls/user32/input.c
++++ b/dlls/user32/input.c
+@@ -906,3 +906,243 @@ void WINAPI UndelegateInput(void *p1, void *p2)
+ {
+     FIXME( "p1 %p p2 %p stub!\n", p1, p2 );
+ }
++
++/* Autorun: mouse look for programs that recentre the cursor every frame.
++ *
++ * F.E.A.R. 2 turns its view by how far WM_MOUSEMOVE says the cursor went
++ * from where it last put it with SetCursorPos, every frame. On the Switch the
++ * stick's motion and those warps race in the runtime: the motion is lost, and
++ * now and then the cursor jumps by hundreds of pixels at once. So for such a
++ * program the warps are not passed on. The cursor moves freely, as it does in
++ * the program's menus, and the mouse messages it reads are rewritten to the
++ * position it expects: where it last warped to, plus the motion since. Near
++ * the screen's edge the cursor is put back in the middle, and that one jump
++ * is left out of the motion. When the program stops warping (a menu), the
++ * messages go through unchanged again. */
++
++#define ML_SYNTH        0x8000
++#define ML_IDLE_MS      300
++#define ML_RESYNC_MS    250
++
++static int ml_state = -1;          /* -1 not checked, 0 off, 1 on */
++static BOOL ml_active;
++static DWORD ml_last_warp;
++static POINT ml_virtual;           /* where the program thinks the cursor is */
++static POINT ml_last;              /* last real position accounted for */
++static BOOL ml_resync;             /* a recentring warp is on its way */
++static POINT ml_resync_pt;
++static DWORD ml_resync_time;
++static LONG ml_recentred, ml_logged, ml_warps, ml_moves;
++static LONG ml_sum_x, ml_sum_y;
++static HWND ml_hwnd;
++static BOOL ml_synth_pending;
++static DWORD ml_synth_time;
++
++static BOOL ml_enabled(void)
++{
++    if (ml_state < 0)
++    {
++        WCHAR path[MAX_PATH], *name;
++        DWORD len = GetModuleFileNameW( NULL, path, ARRAY_SIZE(path) );
++
++        ml_state = 0;
++        if (len && len < ARRAY_SIZE(path))
++        {
++            name = wcsrchr( path, '\\' );
++            name = name ? name + 1 : path;
++            if (!wcsicmp( name, L"FEAR2.exe" )) ml_state = 1;
++        }
++        if (ml_state) ERR( "mouse look: warps of %s are kept from the cursor\n", debugstr_w( path ) );
++    }
++    return ml_state > 0;
++}
++
++/* Autorun builds before the display driver flushed its mouse motion (the
++ * upstream fix of 2026-10-12, commit 0cc936d1) leave the stick's relative
++ * motion collected in win32u, sent on only with the next click or touch: a
++ * view turned by the mouse does not move, then jumps. A
++ * MOUSEEVENTF_MOVE_NOCOALESCE through the same call the driver uses sends what
++ * was collected; with nothing collected it sends nothing. The collection is
++ * the calling thread's, the one whose message check ran the driver, so the
++ * flush is made from each thread that reads messages, a few milliseconds
++ * apart at most. The call goes through the WoW64 thunk as it is, so the
++ * INPUT is laid out the 64-bit way. */
++void autorun_mouse_flush(void)
++{
++    static DWORD last[64];
++    static LONG flushes;
++    struct
++    {
++        DWORD type;
++        DWORD pad;
++        LONG dx, dy;
++        DWORD mouseData, dwFlags, time;
++        DWORD pad2;
++        ULONGLONG extra;
++    } input64;
++    struct
++    {
++        UINT flags;
++        ULONG input;
++        ULONG lparam;
++    } params;
++    DWORD now = GetTickCount(), *slot = &last[(GetCurrentThreadId() >> 2) & 63];
++
++    C_ASSERT( sizeof(input64) == 40 );
++    if (now - *slot < 4) return;
++    *slot = now;
++    memset( &input64, 0, sizeof(input64) );
++    input64.type = INPUT_MOUSE;
++    input64.dwFlags = MOUSEEVENTF_MOVE_NOCOALESCE;
++    params.flags = 0;
++    params.input = (ULONG)(ULONG_PTR)&input64;
++    params.lparam = 0;
++    NtUserCallHwndParam( 0, (UINT_PTR)&params, NtUserCallHwndParam_SendHardwareInput );
++    if (InterlockedIncrement( &flushes ) == 1) ERR( "flushing the display driver's collected mouse motion\n" );
++}
++
++BOOL WINAPI SetCursorPos( INT x, INT y )
++{
++    POINT real;
++    DWORD now;
++    int width, height;
++
++    if (!ml_enabled()) return NtUserSetCursorPos( x, y );
++
++    now = GetTickCount();
++    NtUserGetCursorPos( &real );
++    if (!ml_active || now - ml_last_warp > ML_IDLE_MS)
++    {
++        ml_active = TRUE;
++        ml_last = real;
++        ml_resync = FALSE;
++        if (InterlockedIncrement( &ml_logged ) <= 10)
++            ERR( "mouse look on: program warps to %d,%d, cursor at %ld,%ld\n", x, y, real.x, real.y );
++    }
++    ml_last_warp = now;
++    if (!(++ml_warps % 600))
++        ERR( "mouse look: %ld warps, %ld mouse messages moved the view by %ld,%ld in all; cursor at %ld,%ld\n",
++             ml_warps, ml_moves, ml_sum_x, ml_sum_y, real.x, real.y );
++    ml_virtual.x = x;
++    ml_virtual.y = y;
++    if (ml_synth_pending && now - ml_synth_time > 200) ml_synth_pending = FALSE;
++    if (!ml_synth_pending)
++    {
++        HWND hwnd = ml_hwnd && IsWindow( ml_hwnd ) ? ml_hwnd : GetActiveWindow();
++        POINT client = { x, y };
++
++        if (hwnd && ScreenToClient( hwnd, &client ) &&
++            PostMessageW( hwnd, WM_MOUSEMOVE, ML_SYNTH, MAKELPARAM( (WORD)(short)client.x, (WORD)(short)client.y ) ))
++            ml_synth_pending = TRUE, ml_synth_time = now;
++    }
++
++    if (ml_resync && now - ml_resync_time > ML_RESYNC_MS)
++    {
++        ml_last = real;
++        ml_resync = FALSE;
++    }
++    width = GetSystemMetrics( SM_CXSCREEN );
++    height = GetSystemMetrics( SM_CYSCREEN );
++    if (!ml_resync && width > 0 && height > 0 &&
++        (real.x < width / 8 || real.x >= width - width / 8 ||
++         real.y < height / 6 || real.y >= height - height / 6))
++    {
++        ml_resync = TRUE;
++        ml_resync_pt.x = width / 2;
++        ml_resync_pt.y = height / 2;
++        ml_resync_time = now;
++        NtUserSetCursorPos( ml_resync_pt.x, ml_resync_pt.y );
++        if (InterlockedIncrement( &ml_recentred ) <= 5 || !(ml_recentred % 100))
++            ERR( "mouse look: cursor at %ld,%ld, back to the middle (%ld times)\n", real.x, real.y, ml_recentred );
++    }
++    return TRUE;
++}
++
++/* A program's SetCursorPos makes Windows queue a WM_MOUSEMOVE at the new
++ * place; F.E.A.R. 2 keeps the last position it was told about and turns by
++ * its distance from the centre every frame until told otherwise. With the
++ * warp kept from the cursor that message is posted here instead, marked so
++ * that it is passed on as it is. */
++
++static void ml_log_input( const MSG *msg, BOOL remove )
++{
++    static LONG keys_logged, moves_on, moves_off;
++
++    if (!remove) return;
++    if ((msg->message == WM_KEYDOWN || msg->message == WM_KEYUP ||
++         msg->message == WM_SYSKEYDOWN || msg->message == WM_SYSKEYUP) && keys_logged < 200)
++    {
++        keys_logged++;
++        ERR( "input: %s vk %#Ix at %lu\n", msg->message == WM_KEYUP || msg->message == WM_SYSKEYUP ? "up" : "down",
++             msg->wParam, msg->time );
++    }
++    else if (msg->message == WM_MOUSEMOVE && !(msg->wParam & ML_SYNTH) &&
++             (ml_active ? moves_on++ < 300 : moves_off++ < 40))
++    {
++        ERR( "input: mouse at %ld,%ld at %lu (look %s)\n", msg->pt.x, msg->pt.y, msg->time,
++             ml_active ? "on" : "off" );
++    }
++}
++
++void autorun_mouselook_filter( MSG *msg, BOOL remove )
++{
++    POINT p, last, virt;
++    LONG client_x, client_y;
++
++    if (ml_state <= 0) return;
++    ml_log_input( msg, remove );
++    if (msg->message == WM_MOUSEMOVE && (msg->wParam & ML_SYNTH))
++    {
++        /* Ours: the place the program warped to, in its window. */
++        msg->wParam &= ~ML_SYNTH;
++        msg->pt.x = ml_virtual.x;
++        msg->pt.y = ml_virtual.y;
++        if (remove) ml_synth_pending = FALSE;
++        return;
++    }
++    if (!ml_active) return;
++    if (msg->message < WM_MOUSEFIRST || msg->message > WM_MOUSELAST ||
++        msg->message == WM_MOUSEWHEEL || msg->message == WM_MOUSEHWHEEL) return;
++    if (GetTickCount() - ml_last_warp > ML_IDLE_MS)
++    {
++        ml_active = FALSE;
++        if (InterlockedIncrement( &ml_logged ) <= 10) ERR( "mouse look off: the program stopped warping\n" );
++        return;
++    }
++    if (msg->hwnd) ml_hwnd = msg->hwnd;
++
++    p = msg->pt;
++    last = ml_last;
++    if (ml_resync)
++    {
++        int near_target = abs( p.x - ml_resync_pt.x ) <= 40 && abs( p.y - ml_resync_pt.y ) <= 40;
++        int far_from_last = abs( p.x - last.x ) > 80 || abs( p.y - last.y ) > 80;
++
++        /* The recentring warp itself, maybe with some motion merged into it:
++         * count from the middle, not from where the cursor was. */
++        if (near_target && (far_from_last || (p.x == ml_resync_pt.x && p.y == ml_resync_pt.y)))
++        {
++            last = ml_resync_pt;
++            if (remove) ml_resync = FALSE;
++        }
++    }
++
++    virt.x = ml_virtual.x + (p.x - last.x);
++    virt.y = ml_virtual.y + (p.y - last.y);
++    if (remove)
++    {
++        if (p.x != last.x || p.y != last.y)
++        {
++            ml_moves++;
++            ml_sum_x += p.x - last.x;
++            ml_sum_y += p.y - last.y;
++        }
++        ml_virtual = virt;
++        ml_last = p;
++    }
++
++    client_x = (short)LOWORD( msg->lParam ) - p.x;
++    client_y = (short)HIWORD( msg->lParam ) - p.y;
++    msg->lParam = MAKELPARAM( (WORD)(short)(virt.x + client_x), (WORD)(short)(virt.y + client_y) );
++    msg->pt = virt;
++}
+diff --git a/dlls/user32/message.c b/dlls/user32/message.c
+index 42f4a807..35bbbc9a 100644
+--- a/dlls/user32/message.c
++++ b/dlls/user32/message.c
+@@ -709,7 +709,12 @@ BOOL WINAPI PostThreadMessageA( DWORD thread, UINT msg, WPARAM wparam, LPARAM lp
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH PeekMessageW( MSG *msg_out, HWND hwnd, UINT first, UINT last, UINT flags )
+ {
+-    return NtUserPeekMessage( msg_out, hwnd, first, last, flags );
++    BOOL ret = NtUserPeekMessage( msg_out, hwnd, first, last, flags );
++
++    autorun_mouse_flush();
++    if (!ret) return FALSE;
++    autorun_mouselook_filter( msg_out, (flags & PM_REMOVE) != 0 );
++    return TRUE;
+ }
+ 
+ 
+@@ -730,7 +735,11 @@ BOOL WINAPI DECLSPEC_HOTPATCH PeekMessageA( MSG *msg, HWND hwnd, UINT first, UIN
+  */
+ BOOL WINAPI DECLSPEC_HOTPATCH GetMessageW( MSG *msg, HWND hwnd, UINT first, UINT last )
+ {
+-    return NtUserGetMessage( msg, hwnd, first, last );
++    BOOL ret = NtUserGetMessage( msg, hwnd, first, last );
++
++    autorun_mouse_flush();
++    if (ret > 0) autorun_mouselook_filter( msg, TRUE );
++    return ret;
+ }
+ 
+ 
+diff --git a/dlls/user32/user32.spec b/dlls/user32/user32.spec
+index 241b4005..7c6a053d 100644
+--- a/dlls/user32/user32.spec
++++ b/dlls/user32/user32.spec
+@@ -1029,7 +1029,7 @@
+ @ stdcall SetCoalescableTimer(long long long ptr long) NtUserSetTimer
+ @ stdcall -import SetCursor(long) NtUserSetCursor
+ @ stub SetCursorContents
+-@ stdcall -import SetCursorPos(long long) NtUserSetCursorPos
++@ stdcall SetCursorPos(long long)
+ @ stdcall SetDebugErrorLevel(long)
+ @ stdcall SetDeskWallpaper(str)
+ # @ stub SetDesktopColorTransform
+diff --git a/dlls/user32/user_private.h b/dlls/user32/user_private.h
+index abb84b0e..a7f3b6e3 100644
+--- a/dlls/user32/user_private.h
++++ b/dlls/user32/user_private.h
+@@ -160,6 +160,8 @@ typedef struct
+ 
+ extern int bitmap_info_size( const BITMAPINFO * info, WORD coloruse );
+ extern BOOL get_icon_size( HICON handle, SIZE *size );
++extern void autorun_mouselook_filter( MSG *msg, BOOL remove );
++extern void autorun_mouse_flush(void);
+ 
+ extern struct user_api_hook *user_api;
+ LRESULT WINAPI USER_DefDlgProc(HWND, UINT, WPARAM, LPARAM, BOOL);
